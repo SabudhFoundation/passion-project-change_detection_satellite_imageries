@@ -126,7 +126,7 @@ if st.button("🚀 Start Training", type="primary", use_container_width=True):
 
     else:
         # Build CLI command
-        project_root = Path(__file__).resolve().parents[3]
+        project_root = Path(__file__).resolve().parents[2]
         cmd = [
             sys.executable, str(project_root / "src" / "main.py"), "train",
             "--epochs", str(epochs),

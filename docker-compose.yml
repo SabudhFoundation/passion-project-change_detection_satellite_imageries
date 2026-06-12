@@ -31,6 +31,43 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
     command: ["train", "--epochs", "30"]
 
+  streamlit:
+    build: .
+    image: change-detection:latest
+    profiles: ["streamlit"]
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./src/data/processed/artifacts:/app/src/data/processed/artifacts
+      - ./src/data/raw/onera-satellite-change-detection-dataset:/data/oscd:ro
+    environment:
+      UCDNET_DATA_ROOT: /data/oscd
+      UCDNET_OUTPUT_DIR: /app/src/data/processed/artifacts
+    entrypoint: ["poetry", "run", "streamlit"]
+    command: ["run", "streamlit_app/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+
+  streamlit-gpu:
+    build: .
+    image: change-detection:latest
+    profiles: ["streamlit-gpu"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./src/data/processed/artifacts:/app/src/data/processed/artifacts
+      - ./src/data/raw/onera-satellite-change-detection-dataset:/data/oscd:ro
+    environment:
+      UCDNET_DATA_ROOT: /data/oscd
+      UCDNET_OUTPUT_DIR: /app/src/data/processed/artifacts
+    entrypoint: ["poetry", "run", "streamlit"]
+    command: ["run", "streamlit_app/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+
   predict:
     build: .
     image: change-detection:latest
@@ -40,7 +77,7 @@ services:
       - ./input:/input:ro
     environment:
       UCDNET_OUTPUT_DIR: /app/src/data/processed/artifacts
-    entrypoint: ["ucdnet", "predict"]
+    entrypoint: ["poetry", "run", "ucdnet", "predict"]
     command:
       - "--model"
       - "/app/src/data/processed/artifacts/best_model.keras"

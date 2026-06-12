@@ -19,14 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml poetry.toml README.md ./
+RUN pip install poetry==1.8.3 \
+    && poetry install --only main --no-interaction --no-ansi --no-root
+
 COPY change_detection_cli ./change_detection_cli
 COPY src ./src
-
-RUN pip install poetry==1.8.3 \
-    && poetry config virtualenvs.create false \
-    && poetry install --only main --no-interaction --no-ansi
+COPY streamlit_app ./streamlit_app
 
 RUN mkdir -p /app/src/data/processed/artifacts /data/oscd
 
-ENTRYPOINT ["ucdnet"]
+ENTRYPOINT ["poetry", "run", "ucdnet"]
 CMD ["train", "--help"]
