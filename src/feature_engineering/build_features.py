@@ -1,4 +1,4 @@
-"""Augmentation, oversampling, and TensorFlow dataset construction."""
+"""Augmentation, oversamp ling, and TensorFlow dataset construction."""
 
 from __future__ import annotations
 
