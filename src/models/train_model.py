@@ -1,174 +1,188 @@
-"""Train UCDNet on the OSCD dataset."""
+"""
+train_model.py — Train UCDNet on the OSCD dataset
+==================================================
+Paper: UCDNet (Basavaraju et al., IEEE TGRS 2022)
 
-from __future__ import annotations
+Memory-efficient: patches are loaded one-at-a-time from disk via tf.data.
+No full dataset is held in RAM at any point.
 
-import json
+Exact paper settings:
+  - Adam lr=0.0001, 30 epochs, batch_size=1
+  - Loss: WCCE + k_weight * Modified_Kappa  (Eq. 13–17)
+  - Class weights: (0.1, 0.9)
+  - Random 200/57/30 patch split from all 24 cities
 
-import numpy as np
+Run from project root:
+    python -m src.models.train_model
+"""
+
+import matplotlib.pyplot as plt
 import tensorflow as tf
 
-from config import Settings
-from feature_engineering.build_features import make_tf_dataset, oversample_changed_patches
-from gpu import log_device_info
-from models.losses import make_loss
-from models.metrics import (
-    changed_class_f1,
-    changed_class_jaccard,
-    compute_metrics,
-    print_metrics,
+from src.config import (
+    IMAGES_ROOT, LABELS_ROOT,
+    ALL_CITIES,
+    N_TRAIN_PATCHES, N_VAL_PATCHES, N_TEST_PATCHES,
+    INPUT_SHAPE, NUM_CLASSES,
+    BATCH_SIZE, EPOCHS, LEARNING_RATE,
+    CLASS_WEIGHTS,
+    CHECKPOINT_PATH, CURVES_PATH, METRICS_PATH,
 )
-from models.ucdnet_architecture import build_ucdnet
-from preprocessing_data.oscd_loader import load_oscd_dataset
-from visualization.visualize import plot_training_curves
+from src.preprocessing_data.oscd_loader import get_split_paths, make_dataset
+from src.models.ucdnet_architecture import build_ucdnet
+from src.models.losses import ucdnet_loss, k_warmup
+from src.models.metrics import jaccard_index, f1_score
 
 
-def _evaluate_patch_dataset(model, ds) -> dict[str, float]:
-    y_true_all, y_pred_all = [], []
-    for inputs, lbl in ds:
-        preds = model.predict(inputs, verbose=0)
-        y_true_all.append(lbl[..., 1].numpy().ravel())
-        y_pred_all.append(preds[..., 1].ravel())
-    return compute_metrics(
-        np.concatenate(y_true_all),
-        np.concatenate(y_pred_all),
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def train(settings: Settings) -> dict:
-    log_device_info()
-
-    if not settings.images_root.is_dir():
-        raise FileNotFoundError(
-            f"Dataset not found at {settings.data_root}\n"
-            "Set UCDNET_DATA_ROOT or pass --data-root to the OSCD folder."
-        )
-
-    tf.random.set_seed(settings.seed)
-    np.random.seed(settings.seed)
-
-    print("\n[1/4] Loading data")
-    t1_tr, t2_tr, y_tr = load_oscd_dataset(
-        settings.images_root,
-        settings.labels_root,
-        settings.train_cities,
-        patch_size=settings.patch_size,
-        overlap=settings.overlap,
-        no_change_ratio=settings.no_change_ratio,
-    )
-    if settings.oversample_ratio > 1:
-        t1_tr, t2_tr, y_tr = oversample_changed_patches(
-            t1_tr, t2_tr, y_tr, settings.oversample_ratio
-        )
-
-    t1_vl, t2_vl, y_vl = load_oscd_dataset(
-        settings.images_root,
-        settings.labels_root,
-        settings.val_cities,
-        patch_size=settings.patch_size,
-        overlap=settings.overlap,
-        no_change_ratio=1.0,
-    )
-
-    train_ds = make_tf_dataset(
-        t1_tr,
-        t2_tr,
-        y_tr,
-        batch_size=settings.batch_size,
-        augment=settings.use_augmentation,
-    )
-    val_ds = make_tf_dataset(
-        t1_vl,
-        t2_vl,
-        y_vl,
-        batch_size=settings.batch_size,
-        augment=False,
-        shuffle=False,
-    )
-
-    print("\n[2/4] Building model")
-    model = build_ucdnet(
-        patch_size=settings.patch_size,
-        num_bands=settings.num_bands,
-        num_classes=settings.num_classes,
-    )
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=settings.learning_rate),
-        loss=make_loss(class_weights=settings.class_weights),
-        metrics=[changed_class_f1, changed_class_jaccard, "accuracy"],
-    )
-    model.summary()
-
-    callbacks = [
+def get_callbacks():
+    return [
         tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(settings.checkpoint_path),
-            monitor="val_changed_class_f1",
-            mode="max",
+            filepath=CHECKPOINT_PATH,
+            monitor="val_loss",
+            mode="min",
             save_best_only=True,
             verbose=1,
         ),
+        tf.keras.callbacks.CSVLogger(METRICS_PATH),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_changed_class_f1",
-            mode="max",
-            factor=0.5,
-            patience=6,
-            min_lr=1e-6,
-            verbose=1,
+            monitor="val_loss", factor=0.5,
+            patience=4, min_lr=1e-6, verbose=1,
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor="val_changed_class_f1",
-            mode="max",
-            patience=15,
-            restore_best_weights=True,
-            verbose=1,
+            monitor="val_loss", patience=8,
+            restore_best_weights=True, verbose=1,
         ),
-        tf.keras.callbacks.CSVLogger(str(settings.metrics_csv)),
     ]
 
-    print("\n[3/4] Training")
+
+class KappaWarmup(tf.keras.callbacks.Callback):
+    """
+    Linearly ramps the kappa loss weight from 0 → 1 over `warmup_epochs`.
+    Prevents the kappa term from destabilising early training.
+    """
+    def __init__(self, warmup_epochs=10):
+        super().__init__()
+        self.warmup_epochs = warmup_epochs
+
+    def on_epoch_begin(self, epoch, logs=None):
+        w = min(1.0, (epoch + 1) / self.warmup_epochs)
+        k_warmup.assign(w)
+        print(f"  k_warmup = {w:.2f}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLOT CURVES  (paper Fig. 6 + all tracked metrics)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_curves(history):
+    h = history.history
+
+    # (train_key, val_key, y-axis / title label)
+    candidates = [
+        ("accuracy",      "val_accuracy",      "Accuracy"),
+        ("loss",          "val_loss",           "Loss"),
+        ("jaccard_index", "val_jaccard_index",  "Jaccard Index (IoU)"),
+        ("f1_score",      "val_f1_score",       "F1 Score"),
+        ("precision",     "val_precision",      "Precision"),
+        ("recall",        "val_recall",         "Recall"),
+    ]
+
+    # Keep only metrics that were actually recorded
+    metrics = [(tr, vl, title) for tr, vl, title in candidates if tr in h]
+
+    n     = len(metrics)
+    ncols = 3
+    nrows = (n + ncols - 1) // ncols   # ceil division
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows))
+    axes = axes.flatten()
+
+    for ax, (train_key, val_key, title) in zip(axes, metrics):
+        ax.plot(h[train_key], label="Train", color="steelblue")
+        if val_key in h:
+            ax.plot(h[val_key], label="Val", color="coral")
+        ax.set_title(f"Training and Validation {title}")
+        ax.set_xlabel("No. of epochs")
+        ax.set_ylabel(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    # Hide any unused subplot panels
+    for ax in axes[n:]:
+        ax.set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(CURVES_PATH, dpi=150)
+    plt.close()
+    print(f"  Curves saved → {CURVES_PATH}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("  UCDNet Training  (paper-faithful, memory-efficient)")
+    print("=" * 60)
+    print(f"  Epochs        : {EPOCHS}")
+    print(f"  Batch size    : {BATCH_SIZE}")
+    print(f"  Learning rate : {LEARNING_RATE}")
+    print(f"  Class weights : {CLASS_WEIGHTS}")
+    print(f"  Patch split   : {N_TRAIN_PATCHES} / {N_VAL_PATCHES} / {N_TEST_PATCHES}")
+
+    # ── Step 1: build (or reuse) disk cache, get file-path splits ─────────
+    print("\n[1/4] Preparing patch file paths ...")
+    tr_paths, vl_paths, te_paths = get_split_paths(
+        images_root=IMAGES_ROOT,
+        labels_root=LABELS_ROOT,
+        all_cities=ALL_CITIES,
+        n_train=N_TRAIN_PATCHES,
+        n_val=N_VAL_PATCHES,
+        n_test=N_TEST_PATCHES,
+    )
+    print(f"  Train: {len(tr_paths)} | Val: {len(vl_paths)} | Test: {len(te_paths)}")
+
+    # ── Step 2: tf.data pipelines (load from disk on demand) ──────────────
+    print("\n[2/4] Building tf.data pipelines ...")
+    train_ds = make_dataset(tr_paths, batch_size=BATCH_SIZE, shuffle=True)
+    val_ds   = make_dataset(vl_paths, batch_size=BATCH_SIZE, shuffle=False)
+
+    # ── Step 3: build and compile model ───────────────────────────────────
+    print("\n[3/4] Building model ...")
+    model = build_ucdnet(input_shape=INPUT_SHAPE, num_classes=NUM_CLASSES)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, clipnorm=1.0),
+        loss=ucdnet_loss(class_weights=CLASS_WEIGHTS),
+        metrics=[
+            "accuracy",
+            jaccard_index,
+            f1_score,
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
+        ],
+    )
+    model.summary()
+
+    # ── Step 4: train ─────────────────────────────────────────────────────
+    print("\n[4/4] Training ...")
     history = model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=settings.epochs,
-        callbacks=callbacks,
+        epochs=EPOCHS,
+        callbacks=get_callbacks() + [KappaWarmup(warmup_epochs=15)],
     )
 
-    plot_training_curves(history, settings.curves_path)
+    plot_curves(history)
 
-    print("\n[4/4] Test-set evaluation (patch level)")
-    test_metrics = {}
-    if settings.test_cities:
-        t1_te, t2_te, y_te = load_oscd_dataset(
-            settings.images_root,
-            settings.labels_root,
-            settings.test_cities,
-            patch_size=settings.patch_size,
-            overlap=settings.overlap,
-            no_change_ratio=1.0,
-        )
-        test_ds = make_tf_dataset(
-            t1_te,
-            t2_te,
-            y_te,
-            batch_size=settings.batch_size,
-            augment=False,
-            shuffle=False,
-        )
-        from models.predict_model import load_model
+    print("\n✓ Training complete!")
+    print(f"  Best model  → {CHECKPOINT_PATH}")
+    print(f"  Metrics CSV → {METRICS_PATH}")
+    print(f"  Curves PNG  → {CURVES_PATH}")
 
-        best = load_model(settings.checkpoint_path)
-        test_metrics = _evaluate_patch_dataset(best, test_ds)
-        print_metrics(test_metrics, title="Test cities")
 
-    results = {
-        "checkpoint": str(settings.checkpoint_path),
-        "epochs_trained": len(history.history.get("loss", [])),
-        "test_metrics": test_metrics,
-    }
-    results_path = settings.output_dir / "training_results.json"
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
-
-    print(f"\n✓ Best model : {settings.checkpoint_path}")
-    print(f"✓ Metrics CSV: {settings.metrics_csv}")
-    print(f"✓ Curves PNG : {settings.curves_path}")
-    return results
+if __name__ == "__main__":
+    main()

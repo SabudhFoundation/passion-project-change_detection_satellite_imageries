@@ -1,261 +1,253 @@
-"""OSCD dataset loading and inference image I/O (importable module)."""
+"""
+oscd_loader.py — OSCD Dataset Loader for UCDNet
+================================================
+Paper: UCDNet (Basavaraju et al., IEEE TGRS 2022)
 
-from __future__ import annotations
+Memory-efficient pipeline — patches are saved to disk as .npy files
+and loaded one-at-a-time during training via tf.data.  This avoids
+the 3+ GiB RAM spike from stacking all 287 patches at once.
 
-from pathlib import Path
+Paper-correct data pipeline:
+  1. Extract 512×512 patches (STRIDE=64) from all 24 cities.
+  2. Save each patch as an individual .npy file under CACHE_DIR.
+  3. Randomly assign patch indices → train (200) / val (57) / test (30).
+  4. Return file-path lists; tf.data loads each file on demand.
 
+Usage:
+    from src.preprocessing_data.oscd_loader import get_split_paths, make_dataset
+"""
+
+import os
 import numpy as np
 import rasterio
-import tensorflow as tf
 from rasterio.enums import Resampling
+import tensorflow as tf
 
+# ── Sentinel-2 band file names (13 bands) ─────────────────────────────────
 BAND_FILES = [
     "B01.tif", "B02.tif", "B03.tif", "B04.tif",
     "B05.tif", "B06.tif", "B07.tif", "B08.tif",
-    "B8A.tif", "B09.tif", "B10.tif", "B11.tif", "B12.tif",
+    "B8A.tif", "B09.tif", "B10.tif", "B11.tif", "B12.tif"
 ]
 
-S2_BANDS = [
-    "B01", "B02", "B03", "B04", "B05", "B06",
-    "B07", "B08", "B8A", "B09", "B10", "B11", "B12",
-]
+# ── Patch parameters ───────────────────────────────────────────────────────
+PATCH_SIZE = 512
+STRIDE     = 64    # step between patch starts (= overlap amount per paper)
 
-try:
-    from PIL import Image as PILImage
-
-    _RESAMPLE = PILImage.Resampling.BILINEAR
-except AttributeError:
-    from PIL import Image as PILImage
-
-    _RESAMPLE = PILImage.BILINEAR
+# ── Disk cache directory ───────────────────────────────────────────────────
+# Patches are stored here on first run and reused on subsequent runs.
+CACHE_DIR  = "patch_cache"
 
 
-def read_bands(city_dir, subdir: str = "imgs_1_rect", target_h=None, target_w=None):
-    band_dir = city_dir / subdir if hasattr(city_dir, "__truediv__") else f"{city_dir}/{subdir}"
+# ── Low-level image helpers ───────────────────────────────────────────────
+
+def read_bands(city_dir, subdir="imgs_1_rect", target_h=None, target_w=None):
+    """Read all 13 bands, resample to target size, normalise to [0,1]."""
+    band_dir = os.path.join(city_dir, subdir)
 
     if target_h is None or target_w is None:
-        ref_path = f"{band_dir}/B04.tif"
-        with rasterio.open(ref_path) as src:
+        with rasterio.open(os.path.join(band_dir, "B04.tif")) as src:
             target_h, target_w = src.height, src.width
 
     bands = []
     for bfile in BAND_FILES:
-        with rasterio.open(f"{band_dir}/{bfile}") as src:
+        with rasterio.open(os.path.join(band_dir, bfile)) as src:
             data = src.read(
                 1,
                 out_shape=(target_h, target_w),
-                resampling=Resampling.bilinear,
+                resampling=Resampling.bilinear
             ).astype(np.float32)
         bands.append(data)
 
     img = np.stack(bands, axis=-1)
-    return np.clip(img, 0, 10000) / 10000.0
+    img = np.clip(img, 0, 10000) / 10000.0
+    return img
 
 
-def read_label(label_dir, city: str, target_h: int, target_w: int):
-    cm_path = f"{label_dir}/{city}/cm/{city}-cm.tif"
+def read_label(label_dir, city, target_h, target_w):
+    """Read change-map, remap OSCD values (1=no-change, 2=change) → 0/1."""
+    cm_path = os.path.join(label_dir, city, "cm", f"{city}-cm.tif")
     with rasterio.open(cm_path) as src:
         label = src.read(
             1,
             out_shape=(target_h, target_w),
-            resampling=Resampling.nearest,
+            resampling=Resampling.nearest
         ).astype(np.int32)
     return np.where(label == 2, 1, 0)
 
 
-def extract_patches(img1, img2, label, patch_size: int, stride: int, no_change_ratio: float = 1.0):
-    h, w, _ = img1.shape
-    changed, bg_pool = [], []
-
-    for y in range(0, h - patch_size + 1, stride):
-        for x in range(0, w - patch_size + 1, stride):
-            t1_p = img1[y : y + patch_size, x : x + patch_size]
-            t2_p = img2[y : y + patch_size, x : x + patch_size]
-            lbl_p = label[y : y + patch_size, x : x + patch_size]
-            if np.sum(lbl_p == 1) >= 5:
-                changed.append((t1_p, t2_p, lbl_p))
-            else:
-                bg_pool.append((t1_p, t2_p, lbl_p))
-
-    n_sample = max(1, int(len(changed) * no_change_ratio))
-    if bg_pool:
-        idx = np.random.choice(
-            len(bg_pool),
-            size=min(n_sample, len(bg_pool)),
-            replace=False,
-        )
-        sampled = [bg_pool[i] for i in idx]
-    else:
-        sampled = []
-
-    all_patches = changed + sampled
-    t1_patches = [p[0] for p in all_patches]
-    t2_patches = [p[1] for p in all_patches]
-    lbl_patches = [p[2] for p in all_patches]
-    return t1_patches, t2_patches, lbl_patches, len(changed)
+def pad_to_patch(img1, img2, label):
+    """Reflect-pad so spatial dims are at least PATCH_SIZE."""
+    H, W, _ = img1.shape
+    ph = max(0, PATCH_SIZE - H)
+    pw = max(0, PATCH_SIZE - W)
+    if ph > 0 or pw > 0:
+        img1  = np.pad(img1,  ((0, ph), (0, pw), (0, 0)), mode="reflect")
+        img2  = np.pad(img2,  ((0, ph), (0, pw), (0, 0)), mode="reflect")
+        label = np.pad(label, ((0, ph), (0, pw)),          mode="reflect")
+    return img1, img2, label
 
 
-def to_one_hot(label, num_classes: int = 2):
-    return tf.keras.utils.to_categorical(label, num_classes=num_classes).astype(np.float32)
+def to_one_hot(label, num_classes=2):
+    """(H, W) int → (H, W, C) one-hot float32."""
+    return tf.keras.utils.to_categorical(
+        label, num_classes=num_classes
+    ).astype(np.float32)
 
 
-def load_oscd_dataset(
-    images_root,
-    labels_root,
-    city_list: list[str],
-    patch_size: int = 512,
-    overlap: int = 64,
-    no_change_ratio: float = 1.0,
-):
-    stride = patch_size - overlap
-    t1_all, t2_all, y_all = [], [], []
-    total_changed = total_patches = 0
+# ── Disk-cache helpers ────────────────────────────────────────────────────
 
-    for city in city_list:
-        print(f"  Loading {city} ...", end=" ", flush=True)
-        city_dir = f"{images_root}/{city}"
-        img1 = read_bands(city_dir, "imgs_1_rect")
-        img2 = read_bands(city_dir, "imgs_2_rect", target_h=img1.shape[0], target_w=img1.shape[1])
-        h, w, _ = img1.shape
-        label = read_label(labels_root, city, h, w)
-
-        t1p, t2p, lp, n_changed = extract_patches(
-            img1, img2, label, patch_size, stride, no_change_ratio
-        )
-        for t1, t2, lbl in zip(t1p, t2p, lp):
-            t1_all.append(t1)
-            t2_all.append(t2)
-            y_all.append(to_one_hot(lbl))
-
-        total_changed += n_changed
-        total_patches += len(t1p)
-        print(f"{len(t1p)} patches ({n_changed} with change)")
-
-    print(
-        f"  Total: {total_patches} patches, {total_changed} changed "
-        f"({100 * total_changed / max(total_patches, 1):.1f}%)"
-    )
-    return (
-        np.array(t1_all, dtype=np.float32),
-        np.array(t2_all, dtype=np.float32),
-        np.array(y_all, dtype=np.float32),
-    )
+def _patch_paths(idx, cache_dir=CACHE_DIR):
+    """Return (t1_path, t2_path, y_path) for patch index idx."""
+    base = os.path.join(cache_dir, f"{idx:05d}")
+    return base + "_t1.npy", base + "_t2.npy", base + "_y.npy"
 
 
-def _load_tif(path: str) -> np.ndarray:
-    try:
-        import rasterio
+def build_patch_cache(images_root, labels_root, all_cities,
+                      cache_dir=CACHE_DIR):
+    """
+    Extract all patches from all cities and save to disk as .npy files.
+    Skips extraction if cache already exists (checks for index file).
 
-        with rasterio.open(path) as src:
-            arr = src.read()
-        return arr.transpose(1, 2, 0).astype(np.float32)
-    except Exception:
-        pass
-    arr = np.array(PILImage.open(path)).astype(np.float32)
-    if arr.ndim == 2:
-        arr = arr[:, :, np.newaxis]
-    return arr
+    Returns
+    -------
+    total : int   total number of patches saved
+    """
+    index_file = os.path.join(cache_dir, "total.txt")
+
+    # Re-use existing cache
+    if os.path.isfile(index_file):
+        with open(index_file) as f:
+            total = int(f.read().strip())
+        print(f"  Patch cache found: {total} patches in '{cache_dir}'")
+        return total
+
+    os.makedirs(cache_dir, exist_ok=True)
+    patch_idx = 0
+
+    print(f"\nBuilding patch cache in '{cache_dir}' ...")
+    for city in all_cities:
+        print(f"  Extracting {city} ...", end=" ", flush=True)
+        city_dir = os.path.join(images_root, city)
+
+        img1  = read_bands(city_dir, "imgs_1_rect")
+        img2  = read_bands(city_dir, "imgs_2_rect",
+                           target_h=img1.shape[0], target_w=img1.shape[1])
+        H, W, _ = img1.shape
+        label = read_label(labels_root, city, H, W)
+
+        img1, img2, label = pad_to_patch(img1, img2, label)
+        H, W, _ = img1.shape
+        count = 0
+
+        for y in range(0, H - PATCH_SIZE + 1, STRIDE):
+            for x in range(0, W - PATCH_SIZE + 1, STRIDE):
+                t1   = img1 [y:y+PATCH_SIZE, x:x+PATCH_SIZE]   # (512,512,13)
+                t2   = img2 [y:y+PATCH_SIZE, x:x+PATCH_SIZE]
+                lbl  = label[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
+                y_oh = to_one_hot(lbl)                          # (512,512,2)
+
+                p1, p2, py = _patch_paths(patch_idx, cache_dir)
+                np.save(p1, t1)
+                np.save(p2, t2)
+                np.save(py, y_oh)
+
+                patch_idx += 1
+                count     += 1
+
+        print(f"done  ({count} patches)")
+
+    # Write index so next run skips extraction
+    with open(index_file, "w") as f:
+        f.write(str(patch_idx))
+
+    print(f"  Cache complete: {patch_idx} patches saved.\n")
+    return patch_idx
 
 
-def normalize_reflectance(img: np.ndarray) -> np.ndarray:
-    return np.clip(img, 0, 10000).astype(np.float32) / 10000.0
+# ── Main split function ───────────────────────────────────────────────────
 
+def get_split_paths(images_root, labels_root, all_cities,
+                    n_train=200, n_val=57, n_test=30,
+                    seed=42, cache_dir=CACHE_DIR):
+    """
+    Paper-correct pipeline:
+      1. Build (or reuse) patch cache on disk.
+      2. Randomly assign patch indices → train / val / test.
+      3. Return lists of file paths for each split.
 
-def normalize_per_band(img: np.ndarray) -> np.ndarray:
-    mn = img.min(axis=(0, 1), keepdims=True)
-    mx = img.max(axis=(0, 1), keepdims=True)
-    denom = np.where(mx - mn == 0, 1.0, mx - mn)
-    return ((img - mn) / denom).astype(np.float32)
+    Returns
+    -------
+    tr_paths, vl_paths, te_paths : list of (t1_path, t2_path, y_path) tuples
+    """
+    total = build_patch_cache(images_root, labels_root, all_cities, cache_dir)
 
-
-def _resize_to(img: np.ndarray, h: int, w: int) -> np.ndarray:
-    out = []
-    for c in range(img.shape[2]):
-        ch = PILImage.fromarray(img[:, :, c]).resize((w, h), _RESAMPLE)
-        out.append(np.array(ch, dtype=np.float32))
-    return np.stack(out, axis=2)
-
-
-def _load_from_path(path: str | Path, num_bands: int) -> np.ndarray:
-    path = Path(path)
-    if path.is_file():
-        img = _load_tif(str(path))
-        if img.shape[2] < num_bands:
-            raise FileNotFoundError(f"{path} has {img.shape[2]} bands, need {num_bands}")
-        return img[:, :, :num_bands]
-
-    tifs = list(path.glob("*.tif")) + list(path.glob("*.TIF")) + list(path.glob("*.tiff"))
-    found = {}
-    for p in tifs:
-        stem = p.stem.upper()
-        for band in S2_BANDS:
-            if stem == band.upper() or band.upper() in stem:
-                found[band] = p
-                break
-
-    if len(found) >= num_bands:
-        arrays = [_load_tif(str(found[b]))[:, :, 0] for b in S2_BANDS]
-        ref_h, ref_w = arrays[1].shape
-        resized = []
-        for arr in arrays:
-            if arr.shape != (ref_h, ref_w):
-                arr = np.array(
-                    PILImage.fromarray(arr).resize((ref_w, ref_h), _RESAMPLE),
-                    dtype=np.float32,
-                )
-            resized.append(arr)
-        return np.stack(resized, axis=2).astype(np.float32)
-
-    for p in tifs:
-        try:
-            img = _load_tif(str(p))
-            if img.shape[2] >= num_bands:
-                return img[:, :, :num_bands]
-        except Exception:
-            continue
-
-    raise FileNotFoundError(
-        f"Could not load {num_bands} bands from {path}. "
-        f"Provide per-band TIFs (B01.tif … B12.tif) or one stacked GeoTIFF."
+    assert total >= n_train + n_val + n_test, (
+        f"Only {total} patches available; need "
+        f"{n_train}+{n_val}+{n_test}={n_train+n_val+n_test}. "
+        f"Consider reducing n_train/n_val/n_test."
     )
 
+    np.random.seed(seed)
+    idx = np.random.permutation(total)
 
-def load_image_pair(
-    t1_path: str | Path,
-    t2_path: str | Path,
-    num_bands: int = 13,
-    normalize: str = "reflectance",
-) -> tuple[np.ndarray, np.ndarray]:
-    img1 = _load_from_path(t1_path, num_bands)
-    img2 = _load_from_path(t2_path, num_bands)
+    tr_idx = idx[:n_train]
+    vl_idx = idx[n_train : n_train + n_val]
+    te_idx = idx[n_train + n_val : n_train + n_val + n_test]
 
-    h, w = img1.shape[:2]
-    if img2.shape[:2] != (h, w):
-        img2 = _resize_to(img2, h, w)
+    def to_paths(indices):
+        return [_patch_paths(i, cache_dir) for i in indices]
 
-    if normalize == "per_band":
-        img1 = normalize_per_band(img1)
-        img2 = normalize_per_band(img2)
-    else:
-        img1 = normalize_reflectance(img1)
-        img2 = normalize_reflectance(img2)
+    print(f"  Split → train: {len(tr_idx)} | "
+          f"val: {len(vl_idx)} | test: {len(te_idx)}")
 
-    return img1, img2
+    return to_paths(tr_idx), to_paths(vl_idx), to_paths(te_idx)
 
 
-def load_label(path: str | Path, target_shape: tuple[int, int] | None = None) -> np.ndarray:
-    path = Path(path)
-    try:
-        with rasterio.open(path) as src:
-            lbl = src.read(1)
-        lbl = np.where(lbl == 2, 1, np.where(lbl > 0, 1, 0)).astype(np.uint8)
-    except Exception:
-        lbl = (np.array(PILImage.open(path)) > 0).astype(np.uint8)
+# ── tf.data pipeline ──────────────────────────────────────────────────────
 
-    if target_shape and lbl.shape != target_shape:
-        h, w = target_shape
-        lbl = np.array(PILImage.fromarray(lbl).resize((w, h), _RESAMPLE)) > 0
-        lbl = lbl.astype(np.uint8)
-    return lbl
+def make_dataset(path_tuples, batch_size=1, shuffle=False):
+    """
+    Build a tf.data.Dataset that loads one patch at a time from disk.
 
+    Parameters
+    ----------
+    path_tuples : list of (t1_path, t2_path, y_path)
+    batch_size  : int
+    shuffle     : bool
 
+    Returns
+    -------
+    tf.data.Dataset yielding ({"T1": ..., "T2": ...}, Y)
+    each of shape (batch, 512, 512, 13/2) float32
+    """
+    t1_paths = [p[0] for p in path_tuples]
+    t2_paths = [p[1] for p in path_tuples]
+    y_paths  = [p[2] for p in path_tuples]
+
+    def load_patch(t1_p, t2_p, y_p):
+        t1 = tf.numpy_function(
+            lambda p: np.load(p.decode()).astype(np.float32),
+            [t1_p], tf.float32)
+        t2 = tf.numpy_function(
+            lambda p: np.load(p.decode()).astype(np.float32),
+            [t2_p], tf.float32)
+        y  = tf.numpy_function(
+            lambda p: np.load(p.decode()).astype(np.float32),
+            [y_p],  tf.float32)
+
+        t1.set_shape([PATCH_SIZE, PATCH_SIZE, 13])
+        t2.set_shape([PATCH_SIZE, PATCH_SIZE, 13])
+        y .set_shape([PATCH_SIZE, PATCH_SIZE, 2])
+
+        return {"T1": t1, "T2": t2}, y
+
+    ds = tf.data.Dataset.from_tensor_slices((t1_paths, t2_paths, y_paths))
+
+    if shuffle:
+        ds = ds.shuffle(buffer_size=len(t1_paths), reshuffle_each_iteration=True)
+
+    ds = ds.map(load_patch, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.batch(batch_size)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds

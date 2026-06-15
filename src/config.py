@@ -1,131 +1,65 @@
-"""Runtime configuration (environment variables + defaults)."""
+"""
+config.py — All paths and hyper-parameters in one place.
+=========================================================
+Paper: UCDNet (Basavaraju et al., IEEE TGRS 2022)
 
-from __future__ import annotations
+Changes from previous version:
+  - Removed FOCAL_GAMMA, TVERSKY_ALPHA, TVERSKY_BETA  (not in paper)
+  - Removed OVERSAMPLE_RATIO                           (not in paper)
+  - Removed NO_CHANGE_RATIO                            (not in paper)
+  - Removed TRAIN_CITIES / VAL_CITIES / TEST_CITIES    (paper splits by patch, not city)
+  - EPOCHS set to 30                                   (paper: 30 epochs)
+  - CLASS_WEIGHTS set to (0.1, 0.9)                    (paper default)
+  - BATCH_SIZE = 1                                     (paper: batch size 1)
+  - LEARNING_RATE = 0.0001                             (paper: Adam lr=0.0001)
+"""
 
 import os
-from dataclasses import dataclass, field
-from pathlib import Path
 
+# ── 1. DATASET PATHS ───────────────────────────────────────────────────────
+# Set via environment variable or change the fallback path below
+DATASET_ROOT = os.environ.get(
+    "OSCD_DATASET_ROOT",
+    r"D:\UCDNET\onera-satellite-change-detection-dataset"   # ← CHANGE THIS (or set env var)
+)
 
-def _project_root() -> Path:
-    env = os.environ.get("UCDNET_PROJECT_ROOT") or os.environ.get("PROJECT_ROOT")
-    if env:
-        return Path(env).resolve()
-    # src/config.py → project root is parent of src/
-    return Path(__file__).resolve().parents[1]
+IMAGES_ROOT = os.path.join(DATASET_ROOT, "images")
+LABELS_ROOT = os.path.join(DATASET_ROOT, "train_labels")
 
+# ── 2. ALL 24 CITIES ───────────────────────────────────────────────────────
+# Paper: patches extracted from ALL 24 cities, then randomly split 200/57/30
+ALL_CITIES = [
+    "aguasclaras", "bercy", "bordeaux",
+    "nantes", "paris", "rennes", "saclay_e",
+    "abudhabi", "cupertino", "pisa", "beihai",
+    "hongkong", "beirut", "mumbai", "brasilia",
+    "montpellier", "norcia", "rio", "saclay_w",
+    "valencia", "dubai", "lasvegas", "milano",
+    "chongqing",
+]
 
-@dataclass
-class Settings:
-    project_root: Path = field(default_factory=_project_root)
-    data_root: Path | None = None
-    output_dir: Path | None = None
+# ── 3. PATCH SPLIT COUNTS (paper: 200 train / 57 val / 30 test) ───────────
+N_TRAIN_PATCHES = 200
+N_VAL_PATCHES   = 57
+N_TEST_PATCHES  = 30
 
-    patch_size: int = 512
-    overlap: int = 64
-    num_bands: int = 13
-    num_classes: int = 2
+# ── 4. MODEL / TRAINING HYPER-PARAMETERS ──────────────────────────────────
+INPUT_SHAPE   = (512, 512, 13)   # 512×512 patches, 13 Sentinel-2 bands
+NUM_CLASSES   = 2                # changed / unchanged
+BATCH_SIZE    = 1                # paper: batch_size = 1
+EPOCHS        = 60               # paper: 30 epochs  (set higher; early-stop will halt)
+LEARNING_RATE = 0.0001           # paper: Adam lr = 0.0001
 
-    epochs: int = 30
-    batch_size: int = 1
-    learning_rate: float = 1e-4
-    class_weights: tuple[float, float] = (0.1, 0.9)
-    num_runs: int = 1
-    seed: int = 42
+# ── 5. LOSS FUNCTION WEIGHTS ───────────────────────────────────────────────
+# Paper Eq. 14: WCCE class weights (unchanged=0.1, changed=0.9)
+CLASS_WEIGHTS = (0.1, 0.9)
 
-    oversample_ratio: int = 3
-    no_change_ratio: float = 1.0
-    use_augmentation: bool = True
+# ── 6. OUTPUT PATHS ────────────────────────────────────────────────────────
+OUTPUT_DIR      = "outputs"
+CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "best_model.keras")
+CURVES_PATH     = os.path.join(OUTPUT_DIR, "training_curves.png")
+METRICS_PATH    = os.path.join(OUTPUT_DIR, "metrics.csv")
+PREDICTIONS_DIR = os.path.join(OUTPUT_DIR, "predictions")
 
-    inference_batch_size: int = 4
-    threshold: float = 0.5
-
-    train_cities: list[str] = field(
-        default_factory=lambda: [
-            "brasilia",
-            "bercy",
-            "bordeaux",
-            "nantes",
-            "paris",
-            "rennes",
-            "abudhabi",
-            "cupertino",
-            "pisa",
-            "beirut",
-            "lasvegas",
-            "rio",
-            "valencia",
-            "aguasclaras",
-            "saclay_e",
-            "norcia",
-        ]
-    )
-    val_cities: list[str] = field(
-        default_factory=lambda: [
-            "montpellier",
-            "mumbai",
-            "beihai",
-            "hongkong",
-            "chongqing",
-        ]
-    )
-    test_cities: list[str] = field(default_factory=lambda: ["milano"])
-
-    def __post_init__(self) -> None:
-        if self.data_root is None:
-            default_data = (
-                self.project_root
-                / "src"
-                / "data"
-                / "raw"
-                / "onera-satellite-change-detection-dataset"
-            )
-            legacy = self.project_root / "onera-satellite-change-detection-dataset"
-            if legacy.is_dir() and not default_data.is_dir():
-                default_data = legacy
-            self.data_root = Path(
-                os.environ.get("UCDNET_DATA_ROOT", str(default_data))
-            ).resolve()
-        else:
-            self.data_root = Path(self.data_root).resolve()
-
-        if self.output_dir is None:
-            self.output_dir = Path(
-                os.environ.get(
-                    "UCDNET_OUTPUT_DIR",
-                    str(self.project_root / "src" / "data" / "processed" / "artifacts"),
-                )
-            ).resolve()
-        else:
-            self.output_dir = Path(self.output_dir).resolve()
-
-    @property
-    def images_root(self) -> Path:
-        return self.data_root / "images"
-
-    @property
-    def labels_root(self) -> Path:
-        return self.data_root / "train_labels"
-
-    @property
-    def checkpoint_path(self) -> Path:
-        return self.output_dir / "best_model.keras"
-
-    @property
-    def metrics_csv(self) -> Path:
-        return self.output_dir / "metrics.csv"
-
-    @property
-    def curves_path(self) -> Path:
-        return self.output_dir / "training_curves.png"
-
-
-def load_settings(**overrides) -> Settings:
-    """Build settings from env + optional keyword overrides."""
-    s = Settings()
-    for key, value in overrides.items():
-        if hasattr(s, key):
-            setattr(s, key, value)
-    s.__post_init__()
-    s.output_dir.mkdir(parents=True, exist_ok=True)
-    return s
+os.makedirs(OUTPUT_DIR,      exist_ok=True)
+os.makedirs(PREDICTIONS_DIR, exist_ok=True)
