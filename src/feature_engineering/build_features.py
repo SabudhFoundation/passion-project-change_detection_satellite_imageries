@@ -40,7 +40,9 @@ def _aug_fn(t1, t2, lbl):
     return t1_out, t2_out, lbl_out
 
 
-def make_tf_dataset(t1, t2, y, batch_size: int = 1, augment: bool = False, shuffle: bool = True):
+def make_tf_dataset(
+    t1, t2, y, batch_size: int = 1, augment: bool = False, shuffle: bool = True
+):
     def _map(t1_b, t2_b, lbl):
         if augment:
             t1_b, t2_b, lbl = _aug_fn(t1_b, t2_b, lbl)
