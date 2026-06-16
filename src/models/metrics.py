@@ -19,8 +19,9 @@ import tensorflow as tf
 SMOOTH = 1e-6
 
 
-# 1. Keras (graph-mode) metrics 
+# 1. Keras (graph-mode) metrics
 # These are passed to model.compile(metrics=[...]) in train_model.py
+
 
 def jaccard_index(y_true, y_pred, smooth=SMOOTH):
     """
@@ -31,8 +32,8 @@ def jaccard_index(y_true, y_pred, smooth=SMOOTH):
     y_pred_b = tf.cast(tf.argmax(y_pred, axis=-1) == 1, tf.float32)
     y_true_f = tf.reshape(y_true_b, [-1])
     y_pred_f = tf.reshape(y_pred_b, [-1])
-    inter    = tf.reduce_sum(y_true_f * y_pred_f)
-    union    = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) - inter
+    inter = tf.reduce_sum(y_true_f * y_pred_f)
+    union = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) - inter
     return (inter + smooth) / (union + smooth)
 
 
@@ -53,8 +54,9 @@ def f1_score(y_true, y_pred, smooth=SMOOTH):
     return 2.0 * pr * re / (pr + re + smooth)
 
 
-# 2. NumPy (test-time) metrics 
+# 2. NumPy (test-time) metrics
 # These operate on binarised (H, W) arrays after argmax.
+
 
 def compute_metrics(y_true_bin, y_pred_bin):
     """
@@ -76,28 +78,26 @@ def compute_metrics(y_true_bin, y_pred_bin):
     TN = np.sum((1 - y_true_f) * (1 - y_pred_f))
     FP = np.sum((1 - y_true_f) * y_pred_f)
     FN = np.sum(y_true_f * (1 - y_pred_f))
-    N  = TP + TN + FP + FN
+    N = TP + TN + FP + FN
 
-    accuracy  = (TP + TN) / (N  + SMOOTH)
+    accuracy = (TP + TN) / (N + SMOOTH)
     precision = TP / (TP + FP + SMOOTH)
-    recall    = TP / (TP + FN + SMOOTH)
-    f1        = 2 * precision * recall / (precision + recall + SMOOTH)
-    jaccard   = TP / (TP + FP + FN + SMOOTH)
+    recall = TP / (TP + FN + SMOOTH)
+    f1 = 2 * precision * recall / (precision + recall + SMOOTH)
+    jaccard = TP / (TP + FP + FN + SMOOTH)
 
     # Cohen's Kappa
-    po    = (TP + TN) / (N + SMOOTH)
-    pe    = (
-        (TP + FP) * (TP + FN) + (TN + FN) * (TN + FP)
-    ) / (N ** 2 + SMOOTH)
+    po = (TP + TN) / (N + SMOOTH)
+    pe = ((TP + FP) * (TP + FN) + (TN + FN) * (TN + FP)) / (N**2 + SMOOTH)
     kappa = (po - pe) / (1.0 - pe + SMOOTH)
 
     return dict(
-        accuracy  = float(accuracy),
-        precision = float(precision),
-        recall    = float(recall),
-        f1        = float(f1),
-        kappa     = float(kappa),
-        jaccard   = float(jaccard),
+        accuracy=float(accuracy),
+        precision=float(precision),
+        recall=float(recall),
+        f1=float(f1),
+        kappa=float(kappa),
+        jaccard=float(jaccard),
     )
 
 
