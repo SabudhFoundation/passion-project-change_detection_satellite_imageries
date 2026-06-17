@@ -4,21 +4,26 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from components.sidebar import render_sidebar
 from components.band_selector import render_band_selector
-from utils.helpers import ensure_src_on_path, load_image_pair_cached, bands_to_display
+from utils.helpers import ensure_src_on_path, bands_to_display
 
 render_sidebar()
 
 st.title("📂 Upload Images")
 st.caption("Upload your bi-temporal Sentinel-2 band files (T1 = before, T2 = after).")
 
-# ── Helper: save uploaded files to a temp folder ─────────────────────────────
+BAND_FILES = [
+    "B01.tif", "B02.tif", "B03.tif", "B04.tif",
+    "B05.tif", "B06.tif", "B07.tif", "B08.tif",
+    "B8A.tif", "B09.tif", "B10.tif", "B11.tif", "B12.tif"
+]
+
 def save_uploaded_files(uploaded_files: list, prefix: str) -> Path | None:
-    """Save uploaded .tif files to a temp directory and return the folder path."""
     if not uploaded_files:
         return None
     tmp_dir = Path(tempfile.gettempdir()) / f"ucdnet_{prefix}"
@@ -27,15 +32,6 @@ def save_uploaded_files(uploaded_files: list, prefix: str) -> Path | None:
         dest = tmp_dir / f.name
         dest.write_bytes(f.read())
     return tmp_dir
-
-
-# ── Normalisation ─────────────────────────────────────────────────────────────
-normalize = st.selectbox(
-    "Normalisation",
-    ["reflectance", "per_band"],
-    help="reflectance: divide by 10000. per_band: z-score per band.",
-)
-st.session_state["normalize"] = normalize
 
 st.divider()
 
@@ -47,7 +43,6 @@ st.markdown(
 )
 
 col1, col2 = st.columns(2)
-
 with col1:
     st.markdown("**🕐 T1 — Before image**")
     t1_files = st.file_uploader(
@@ -55,7 +50,7 @@ with col1:
         type=["tif", "tiff"],
         accept_multiple_files=True,
         key="t1_uploader",
-        help="Select all band .tif files from imgs_1_rect/ folder",
+        help="Select all 13 band .tif files from imgs_1_rect/ folder",
     )
     if t1_files:
         st.success(f"✅ {len(t1_files)} file(s) uploaded")
@@ -69,27 +64,25 @@ with col2:
         type=["tif", "tiff"],
         accept_multiple_files=True,
         key="t2_uploader",
-        help="Select all band .tif files from imgs_2_rect/ folder",
+        help="Select all 13 band .tif files from imgs_2_rect/ folder",
     )
     if t2_files:
         st.success(f"✅ {len(t2_files)} file(s) uploaded")
         for f in sorted(t2_files, key=lambda x: x.name):
             st.caption(f"• {f.name} ({f.size/1024:.0f} KB)")
 
-# ── Optional label upload ─────────────────────────────────────────────────────
-st.markdown("**🏷️ Ground-truth label (optional)**")
 label_file = st.file_uploader(
-    "Upload label file (cm.png)",
+    "🏷️ Ground-truth label (optional — cm.tif or cm.png)",
     type=["png", "tif", "tiff"],
     key="label_uploader",
-    help="From cm/cm.png in the OSCD city folder. Used to compute F1, precision, recall.",
+    help="From cm/ folder in OSCD city. Used to compute F1, precision, recall.",
 )
 if label_file:
     st.success(f"✅ Label uploaded: {label_file.name}")
 
 st.divider()
 
-# ── Save files & process ──────────────────────────────────────────────────────
+# ── Save & Load ───────────────────────────────────────────────────────────────
 if t1_files and t2_files:
     if st.button("💾 Save & Load Images", type="primary", use_container_width=True):
         with st.spinner("Saving uploaded files…"):
@@ -97,7 +90,6 @@ if t1_files and t2_files:
                 t1_dir = save_uploaded_files(t1_files, "t1")
                 t2_dir = save_uploaded_files(t2_files, "t2")
 
-                # Save label if provided
                 label_path = None
                 if label_file:
                     tmp_label = Path(tempfile.gettempdir()) / f"ucdnet_label_{label_file.name}"
@@ -108,11 +100,30 @@ if t1_files and t2_files:
                 st.session_state["t2_path"] = str(t2_dir)
                 st.session_state["label_path"] = label_path
 
-                st.success(f"✅ Files saved! T1: `{t1_dir}` · T2: `{t2_dir}`")
-
-                # Load and preview
+                # Load images using read_bands directly from flat temp dir
                 ensure_src_on_path()
-                img1, img2 = load_image_pair_cached(str(t1_dir), str(t2_dir), normalize=normalize)
+                import os, rasterio
+                from rasterio.enums import Resampling
+
+                def read_flat_dir(band_dir):
+                    b04 = os.path.join(band_dir, "B04.tif")
+                    with rasterio.open(b04) as src:
+                        target_h, target_w = src.height, src.width
+                    bands = []
+                    for bfile in BAND_FILES:
+                        fpath = os.path.join(band_dir, bfile)
+                        with rasterio.open(fpath) as src:
+                            data = src.read(
+                                1,
+                                out_shape=(target_h, target_w),
+                                resampling=Resampling.bilinear
+                            ).astype(np.float32)
+                        bands.append(data)
+                    img = np.stack(bands, axis=-1)
+                    return np.clip(img, 0, 10000) / 10000.0
+
+                img1 = read_flat_dir(str(t1_dir))
+                img2 = read_flat_dir(str(t2_dir))
                 st.session_state["_img1_preview"] = img1
                 st.session_state["_img2_preview"] = img2
                 st.success(f"✅ Images loaded! Shape: {img1.shape} (H × W × 13 bands)")
@@ -128,8 +139,8 @@ img2 = st.session_state.get("_img2_preview")
 
 if img1 is not None and img2 is not None:
     st.subheader("Image Preview")
-
     col_left, col_right = st.columns(2)
+
     with col_left:
         st.markdown("**T1 — Before**")
         mode1, sel1 = render_band_selector("T1 band")

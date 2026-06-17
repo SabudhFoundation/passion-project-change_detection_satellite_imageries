@@ -13,20 +13,38 @@ def render_sidebar():
 
         st.markdown("### 🤖 Model")
 
-        # Model file uploader
-        model_file = st.file_uploader(
-            "Upload model weights",
-            type=["h5", "keras"],
-            key="model_uploader",
-            help="Upload your model.weights.h5 or best_model.keras file",
-        )
+        # If we already have a model loaded, show it with option to change
+        if st.session_state.get("_model_file_name") and st.session_state.get("_model_bytes"):
+            st.success(f"✅ {st.session_state['_model_file_name']}")
+            if st.button("🔄 Change model", use_container_width=True):
+                st.session_state["_model_bytes"] = None
+                st.session_state["_model_file_name"] = None
+                st.session_state["model_path"] = None
+                st.rerun()
+        else:
+            # Show uploader only when no model is loaded
+            model_file = st.file_uploader(
+                "Upload model weights",
+                type=["h5", "keras"],
+                key="model_uploader",
+                help="Upload your model.weights.h5 or best_model.keras file",
+            )
 
-        if model_file:
-            # Save to temp dir
-            tmp_model = Path(tempfile.gettempdir()) / f"ucdnet_{model_file.name}"
-            tmp_model.write_bytes(model_file.read())
-            st.session_state["model_path"] = str(tmp_model)
-            st.success(f"✅ {model_file.name}")
+            if model_file:
+                file_bytes = model_file.read()
+                st.session_state["_model_bytes"] = file_bytes
+                st.session_state["_model_file_name"] = model_file.name
+
+                tmp_model = Path(tempfile.gettempdir()) / f"ucdnet_{model_file.name}"
+                tmp_model.write_bytes(file_bytes)
+                st.session_state["model_path"] = str(tmp_model)
+                st.rerun()  # re-render to switch to "loaded" view
+
+        # Recreate temp file if OS wiped /tmp (e.g. long session)
+        if st.session_state.get("_model_bytes") and st.session_state.get("model_path"):
+            tmp = Path(st.session_state["model_path"])
+            if not tmp.exists():
+                tmp.write_bytes(st.session_state["_model_bytes"])
 
         # Fallback: manual path input
         with st.expander("Or enter path manually"):
@@ -65,7 +83,8 @@ def render_sidebar():
         st.divider()
         if st.button("🗑️ Clear session", use_container_width=True):
             for key in ["t1_path", "t2_path", "prob_map", "change_map",
-                        "metrics", "_img1_preview", "_img2_preview"]:
+                        "metrics", "_img1_preview", "_img2_preview",
+                        "_model_bytes", "_model_file_name", "model_path"]:
                 st.session_state[key] = None if key != "metrics" else {}
             st.rerun()
 
