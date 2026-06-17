@@ -16,9 +16,6 @@ LABELS_ROOT = os.path.join(DATASET_ROOT, "train_labels")
 # ALL 24 CITIES
 ALL_CITIES = [
     "aguasclaras",
-    "bercy",
-    "bordeaux",
-    "nantes",
     "paris",
     "rennes",
     "saclay_e",
